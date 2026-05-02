@@ -119,7 +119,7 @@ def _make_ssl_connector() -> Optional["aiohttp.TCPConnector"]:
     some system CA stores (notably Homebrew's OpenSSL on macOS Apple Silicon).
     When ``certifi`` is installed, use its Mozilla CA bundle to guarantee
     verification. Otherwise fall back to aiohttp's default (which honors
-    ``SSL_CERT_FILE`` env var via ``trust_env=True``).
+    ``SSL_CERT_FILE`` env var via ``trust_env=False``).
     """
     try:
         import ssl
@@ -955,7 +955,12 @@ def _extract_text(item_list: List[Dict[str, Any]]) -> str:
     return ""
 
 
-def _message_type_from_media(media_types: List[str], text: str) -> MessageType:
+def _message_type_from_media(media_types: List[str], text: str, item_list: List[Any] = None) -> MessageType:
+    # FIX Bug 5: detect ITEM_VOICE so voice messages with STT text trigger TTS, not TEXT processing
+    if item_list:
+        for item in (item_list or []):
+            if item.get("type") == ITEM_VOICE:
+                return MessageType.VOICE
     if any(m.startswith("image/") for m in media_types):
         return MessageType.PHOTO
     if any(m.startswith("video/") for m in media_types):
@@ -1002,7 +1007,7 @@ async def qr_login(
     if not AIOHTTP_AVAILABLE:
         raise RuntimeError("aiohttp is required for Weixin QR login")
 
-    async with aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector()) as session:
+    async with aiohttp.ClientSession(trust_env=False, connector=_make_ssl_connector()) as session:
         try:
             qr_resp = await _api_get(
                 session,
@@ -1215,8 +1220,8 @@ class WeixinAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("[%s] Token lock unavailable (non-fatal): %s", self.name, exc)
 
-        self._poll_session = aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector())
-        self._send_session = aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector())
+        self._poll_session = aiohttp.ClientSession(trust_env=False, connector=_make_ssl_connector())
+        self._send_session = aiohttp.ClientSession(trust_env=False, connector=_make_ssl_connector())
         self._token_store.restore(self._account_id)
         self._poll_task = asyncio.create_task(self._poll_loop(), name="weixin-poll")
         self._mark_connected()
@@ -1370,7 +1375,7 @@ class WeixinAdapter(BasePlatformAdapter):
         )
         event = MessageEvent(
             text=text,
-            message_type=_message_type_from_media(media_types, text),
+            message_type=_message_type_from_media(media_types, text, item_list),
             source=source,
             raw_message=message,
             message_id=message_id or None,
@@ -1797,12 +1802,16 @@ class WeixinAdapter(BasePlatformAdapter):
         # Native outbound Weixin voice bubbles are not proven-working in the
         # upstream reference implementation. Prefer a reliable file attachment
         # fallback so users at least receive playable audio, even for .silk.
-        fallback_caption = caption or "[voice message as attachment]"
+        # FIX Bug 1: caption=None prevents double-message (text + attachment)
+        # FIX Bug 7: warn if caller passes caption (silently discarded otherwise)
+        if caption:
+            logger.warning("[%s] send_voice received a caption (%d chars) which is discarded; voice is sent as audio attachment only", self.name, len(caption))
+        caption = None
         try:
             message_id = await self._send_file(
                 chat_id,
                 audio_path,
-                fallback_caption,
+                caption,
                 force_file_attachment=True,
             )
             return SendResult(success=True, message_id=message_id)
@@ -1829,7 +1838,7 @@ class WeixinAdapter(BasePlatformAdapter):
         self,
         chat_id: str,
         path: str,
-        caption: str,
+        caption: Optional[str],
         force_file_attachment: bool = False,
     ) -> str:
         assert self._send_session is not None and self._token is not None
@@ -1883,7 +1892,7 @@ class WeixinAdapter(BasePlatformAdapter):
             "filename": Path(path).name,
             "rawfilemd5": rawfilemd5,
         }
-        if media_type == MEDIA_VOICE and path.endswith(".silk"):
+        if media_type == MEDIA_VOICE and path.endswith((".silk", ".amr")):
             item_kwargs["encode_type"] = 6
             item_kwargs["sample_rate"] = 24000
             item_kwargs["bits_per_sample"] = 16
@@ -1903,7 +1912,7 @@ class WeixinAdapter(BasePlatformAdapter):
             )
 
         last_message_id = f"hermes-weixin-{uuid.uuid4().hex}"
-        await _api_post(
+        resp = await _api_post(
             self._send_session,
             base_url=self._base_url,
             endpoint=EP_SEND_MESSAGE,
@@ -1921,6 +1930,11 @@ class WeixinAdapter(BasePlatformAdapter):
             token=self._token,
             timeout_ms=API_TIMEOUT_MS,
         )
+        # FIX Bug 6: check API error response to avoid false-success on media send
+        ret = resp.get("ret") if resp else None
+        if ret is not None and ret != 0:
+            errmsg = resp.get("errmsg") or resp.get("msg") or "unknown error"
+            raise RuntimeError(f"Weixin media send failed: ret={ret} errmsg={errmsg}")
         return last_message_id
 
     def _outbound_media_builder(self, path: str, force_file_attachment: bool = False):
@@ -2039,11 +2053,14 @@ async def send_weixin_direct(
                 return {"error": f"Weixin send failed: {last_result.error}"}
 
         for media_path, _is_voice in media_files or []:
-            ext = Path(media_path).suffix.lower()
-            if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
-                last_result = await live_adapter.send_image_file(chat_id, media_path)
+            if _is_voice:
+                last_result = await live_adapter.send_voice(chat_id=chat_id, audio_path=media_path)
             else:
-                last_result = await live_adapter.send_document(chat_id, media_path)
+                ext = Path(media_path).suffix.lower()
+                if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
+                    last_result = await live_adapter.send_image_file(chat_id, media_path)
+                else:
+                    last_result = await live_adapter.send_document(chat_id, media_path)
             if not last_result.success:
                 return {"error": f"Weixin media send failed: {last_result.error}"}
 
@@ -2055,7 +2072,7 @@ async def send_weixin_direct(
             "context_token_used": bool(context_token),
         }
 
-    async with aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector()) as session:
+    async with aiohttp.ClientSession(trust_env=False, connector=_make_ssl_connector()) as session:
         adapter = WeixinAdapter(
             PlatformConfig(
                 enabled=True,
@@ -2084,11 +2101,14 @@ async def send_weixin_direct(
                 return {"error": f"Weixin send failed: {last_result.error}"}
 
         for media_path, _is_voice in media_files or []:
-            ext = Path(media_path).suffix.lower()
-            if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
-                last_result = await adapter.send_image_file(chat_id, media_path)
+            if _is_voice:
+                last_result = await adapter.send_voice(chat_id=chat_id, audio_path=media_path)
             else:
-                last_result = await adapter.send_document(chat_id, media_path)
+                ext = Path(media_path).suffix.lower()
+                if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
+                    last_result = await adapter.send_image_file(chat_id, media_path)
+                else:
+                    last_result = await adapter.send_document(chat_id, media_path)
             if not last_result.success:
                 return {"error": f"Weixin media send failed: {last_result.error}"}
 
